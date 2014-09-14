@@ -1,221 +1,191 @@
-//eISCP communications intermediary
-//The communications intermediary does the work of finding devices, then providing a simpler interface with
-//which other programs and systems may interact.
+// eISCP communications intermediary
+// The communications intermediary does the work of finding devices, then providing a simpler interface with
+// which other programs and systems may interact.
 
-//@author: Thaddeus Bond (http://thaddeusbond.com, @thaddeusbond)
-//@date: July 9th, 2014
-//@version: 1.0.3 (July 10th, 2014)
+// @author: Thaddeus Bond (http://thaddeusbond.com, @thaddeusbond)
+// @date: September 9th, 2014
+// @version: 1.2.3
 
-//The protocol is based off of version 1.24 of the "Integra Serial Communication Protocol for AV Receiver"
-//from June 8th, 2012. Testing was performed with an Onkyo TX-NR616, other models have not been tested.
+// The protocol is based off of version 1.24 of the "Integra Serial Communication Protocol for AV Receiver"
+// from June 8th, 2012. Testing was performed with an Onkyo TX-NR616, other models have not been tested.
 
 package main
 
-import "fmt"
-import "net"
-import "encoding/hex"
-import "encoding/binary"
-import "time"
-import "bytes"
-import "reflect"
-import "strings"
-import "strconv"
-import "github.com/gorilla/mux"
-import "os"
+import (
+	"encoding/json"
+	"flag"
+	"fmt"
+	"github.com/gorilla/mux"
+	"net"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+)
 
-//import "io"
-import "net/http"
+// Map used to store the Device objects by the broadcaster.
+var devices = make(map[string]*deviceInfo)
 
-//import "flag"
-import "encoding/json"
+// Map used to store keepAlive Devices (the ones we want to talk to)
+var keepAlive = make(map[string]*keepAliveDevice)
 
-//The three different packet endings specified by the eISCP protocol. There are three more specified by the RS-232C connection protocol.
-//For some reason someone decided that the eISCP protocol could end in any of the SIX. So we have to check/try all of them.
-var EOF = []byte{0x1a}
-var CR = []byte{0x0d}
-var LF = []byte{0x0a}
-var EOF_CR = []byte{0x1a, 0x0d}
-var CR_LF = []byte{0x0d, 0x0a}
-var EM_CR_LF = []byte{0x19, 0x0d, 0x0a}
-var EOF_CR_LF = []byte{0x1a, 0x0d, 0x0a}
-
-//Map used to store the Device objects by the broadcaster.
-var devices = make(map[string]Device)
-
-//Port to check for devices on - default is 60128
+// Command line flags
+var debug bool
+var defaultDevice string
 var devicePort = 60128
 
-//Take a command and encapsulate it according to the ISCP guidelines
-func packageISCP(command string, endBytes []byte) []byte {
-
-	//Start forming header
-	packageISCP := make([]byte, 0)
-	//Beginning of every message
-	bytesISCP := []byte("ISCP")
-	//Append ISCP to the end (the beginning of our empty byte array) of header
-	packageISCP = append(packageISCP, bytesISCP...)
-
-	//eISCP header size (hex decode string is probably the wrong way to do this)
-	bytesHeaderSize, _ := hex.DecodeString("00000010")
-	//Append to the header after ISCP bytes
-	packageISCP = append(packageISCP, bytesHeaderSize...)
-
-	//Get command bytes (we need the size), we'll also use this later
-	bytesCommand := []byte(command)
-	//Createa a new byte array of length 4 for the command size
-	commandSize := make([]byte, 4)
-	//Take the length of the command and put it in the previous byte array. We add 3 for the data end characters.
-	binary.BigEndian.PutUint32(commandSize, uint32(len(bytesCommand)+len(endBytes)))
-	//Append the command length to the current end of the header
-	packageISCP = append(packageISCP, commandSize...)
-
-	//eISCP version (again, hex decode string is probably inefficient)
-	byteVersion, _ := hex.DecodeString("01")
-	//Append to the header after ISCP bytes
-	packageISCP = append(packageISCP, byteVersion...)
-
-	//eISCP reserved bytes (again, inefficient)
-	bytesReserved, _ := hex.DecodeString("000000")
-	//Append to the header after ISCP bytes
-	packageISCP = append(packageISCP, bytesReserved...)
-
-	//We add the bytes of the command that we processed before.
-	packageISCP = append(packageISCP, bytesCommand...)
-
-	//Add the end bytes to the packet
-	packageISCP = append(packageISCP, endBytes...)
-
-	//Add the end characters
-	return packageISCP
-}
-
-func processISCP(packet []byte) (string, bool) {
-	//Check header for valid ISCP format
-	if reflect.DeepEqual(packet[0:4], []byte("ISCP")) && //First four characters ISCP
-		reflect.DeepEqual(packet[4:8], []byte{0x00, 0x00, 0x00, 0x10}) && //Header size is 16
-		reflect.DeepEqual(packet[12:13], []byte{0x01}) && //Version is 01
-		reflect.DeepEqual(packet[13:16], []byte{0x00, 0x00, 0x00}) { //Reserved bytes are 000000
-		//Get the size of the data from the header
-		dataSizeBuf := bytes.NewBuffer(packet[8:12])
-		var dataSize int32
-		binary.Read(dataSizeBuf, binary.BigEndian, &dataSize)
-
-		var endSize int32
-		//And this wonderful block of code is brought to you by the intelligent people that designed the ISCP protocol to use one of many possible end combinations.
-		if reflect.DeepEqual(packet[13+dataSize:16+dataSize], EOF_CR_LF) {
-			endSize = 3
-		} else if reflect.DeepEqual(packet[13+dataSize:16+dataSize], EM_CR_LF) {
-			endSize = 3
-		} else if reflect.DeepEqual(packet[14+dataSize:16+dataSize], EOF_CR) {
-			endSize = 2
-		} else if reflect.DeepEqual(packet[14+dataSize:16+dataSize], CR_LF) {
-			endSize = 2
-		} else if reflect.DeepEqual(packet[15+dataSize:16+dataSize], EOF) {
-			endSize = 1
-		} else if reflect.DeepEqual(packet[15+dataSize:16+dataSize], CR) {
-			endSize = 1
-		} else if reflect.DeepEqual(packet[15+dataSize:16+dataSize], LF) {
-			endSize = 1
-		}
-
-		//Get the actual data in a buffer, then convert to a string
-		dataBuf := bytes.NewBuffer(packet[16 : 16+dataSize-endSize])
-		data := dataBuf.String()
-
-		return data, true
-	}
-	return "", false
-}
-
+// Locate devices in our network and record them
 func findDevices() {
-	//Keep track of which ending we're currently using
-	currentEnd := EOF
-
-	//Create socket, connecting using UDP4, any available local address, to our broadcast IP with the ISCP default port
+	// Create socket, connecting using UDP4, any available local address, to our broadcast IP with the ISCP default port
 	socket, err := net.ListenUDP("udp4", &net.UDPAddr{
-		IP:   net.IPv4zero, //net.IPv4zero is 0.0.0.0 (bind on all addresses)
+		IP:   net.IPv4zero, // net.IPv4zero is 0.0.0.0 (bind on all addresses)
 		Port: devicePort,
 	})
-
 	if err != nil {
 		fmt.Println("Error creating UDP socket")
 	}
 
-	//Keep looping infinitely
+	// Keep looping infinitely
 	for {
-		//We can constantly generate a UDP socket which uses 60128 since we can run it concurrently with a TCP socket.
-		//Here, we're going to broadcast a message, then immediately switch to listening for responses within the next 50ms
-
-		//We'll do this for each type of packet ending, since apparently unknown models can take unknown endings.
-		if bytes.Equal(currentEnd, EOF_CR_LF) {
-			currentEnd = EOF_CR
-		} else if bytes.Equal(currentEnd, EOF_CR) {
-			currentEnd = EOF
-		} else {
-			currentEnd = EOF_CR_LF
-		}
-		//fmt.Printf("Attempting broadcast using end %X\n", currentEnd)
-
-		//If the socket creates successfully - write the question out using the current ending
-		if err == nil {
-			socket.WriteToUDP(packageISCP("!xECNQSTN", currentEnd), &net.UDPAddr{
-				IP:   net.IPv4bcast, //net.IPv4bcast is 255.255.255.255 (send to all available addresses)
-				Port: devicePort,
-			})
-		}
-
-		//Now we need to close out outbound socket, and open an inbound quickly --
-		socketError := make(chan error, 1)
-
-		//Run listen in parallel
-		go func() {
-			for {
-				data := make([]byte, 1024)
-				read, remoteAddr, err := socket.ReadFromUDP(data)
-				if err != nil {
-					socketError <- err
-				}
-				packet, valid := processISCP(data[:read])
-
-				//This isn't a broadcast question from ourselves or another controller
-				if valid && packet[0:5] == "!1ECN" && packet[5:9] != "QSTN" {
-					//Get the meta data about the device from its response
-					data := packet[5:]
-					fragments := strings.Split(data, "/")
-					port, _ := strconv.ParseInt(fragments[1], 10, 0)
-					//Create and store the device response according to its MAC address8
-					if _, present := devices[fragments[3]]; !present {
-						devices[fragments[3]] = Device{fragments[0], //Model
-							int(port), //Port
-							net.ParseIP(strings.Split(remoteAddr.String(), ":")[0]), //IP Address
-							fragments[2],       //Region
-							fragments[3],       //MAC Address
-							new(net.TCPConn),   //And we don't need a TCPConn yet.
-							make(chan bool, 1), //Connection open/close statuses
-							currentEnd}         //The proper byte ending
-					}
-					//fmt.Printf("Broadcast response from %s: %s\n", remoteAddr.String(), data)
-				}
+		// Try all known ISCP endings to make sure we don't miss anybody.
+		for _, broadcastEndBytes := range endBytes {
+			if debug {
+				fmt.Printf("Attempting broadcast using end 0x%X\n", broadcastEndBytes)
 			}
-		}()
-		select {
-		//Problem reading from socket
-		case res := <-socketError:
-			fmt.Println(res)
-		//Finished the 50ms response limit imposed by ISCP protocol
-		case <-time.After(time.Millisecond * 51):
-			//fmt.Printf("Finished polling port %d using end %X\n\n", devicePort, currentEnd)
+
+			// If the socket creates successfully - write the question out using the current ending
+			if err == nil {
+				socket.WriteToUDP(packageISCP("!xECNQSTN", broadcastEndBytes), &net.UDPAddr{
+					IP:   net.IPv4bcast, // net.IPv4bcast is 255.255.255.255 (send to all available addresses)
+					Port: devicePort,
+				})
+			}
+
+			// Run listen in parallel
+			go func() {
+				timeout := time.Now().Add(time.Millisecond * 50)
+
+				for time.Now().Before(timeout) {
+					data := make([]byte, 1024)
+
+					// We should get a response within 50ms
+					socket.SetReadDeadline(time.Now().Add(time.Millisecond * 51))
+					read, remoteAddr, err := socket.ReadFromUDP(data)
+					if err != nil {
+						// We timed out or died, whatevs.
+					}
+
+					packet, valid := processISCP(data[:read])
+					// This isn't a broadcast question from ourselves or another controller
+					if valid && packet[0:5] == "!1ECN" && packet[5:9] != "QSTN" {
+						// Get the meta data about the device from its response
+						data := packet[5:]
+						if debug {
+							fmt.Println("DEBUG: Received device response:", data, "from", remoteAddr.String())
+						}
+						go foundDevice(data, remoteAddr)
+					}
+				}
+			}()
+
+			// We don't want to do this too much, so we'll sleep for five seconds before trying again.
+			time.Sleep(time.Second * 5)
+		}
+	}
+}
+
+// Every time a device responds, verify it
+func foundDevice(devicePacket string, remoteAddr *net.UDPAddr) {
+	fragments := strings.Split(devicePacket, "/")
+	port, _ := strconv.ParseInt(fragments[1], 10, 0)
+	// Create and store the device response according to its MAC address
+	device := &deviceInfo{
+		Model:   fragments[0],                                            // Model
+		Port:    int(port),                                               // Port
+		IP:      net.ParseIP(strings.Split(remoteAddr.String(), ":")[0]), // IP Address
+		Region:  fragments[2],                                            // Region
+		Macaddr: fragments[3],                                            // MAC Address
+	}
+	if _, present := devices[device.Macaddr]; !present {
+		devices[device.Macaddr] = device
+		if debug {
+			fmt.Println("DEBUG: Added device", fragments[0], "with MAC addr", fragments[3], "to collection")
+		}
+	}
+	if _, keepMeAlive := keepAlive[device.Macaddr]; keepMeAlive {
+		// The user loves me. I'm important.
+		if keepAlive[device.Macaddr].device != devices[device.Macaddr] {
+			// We need to update our device info
+			keepAliveTmp := keepAlive[device.Macaddr]
+			keepAliveTmp.device = devices[device.Macaddr]
+			keepAlive[device.Macaddr] = keepAliveTmp
+			if debug {
+				fmt.Println("DEBUG: Updating device", device.Macaddr, "info")
+			}
 		}
 
-		//We don't want to do this too much, so we'll sleep for five seconds before trying again.
-		time.Sleep(time.Second * 1)
+		if keepAlive[device.Macaddr].messenger == nil {
+			// We need to set up a messenger
+			if debug {
+				fmt.Println("DEBUG: Generating messenger for", device.Macaddr)
+			}
+			go connectDevice(device.Macaddr)
+		}
 	}
+}
+
+func connectDevice(theTarget string) {
+	socket, err := net.DialTCP("tcp4", nil, &net.TCPAddr{
+		IP:   devices[theTarget].IP,
+		Port: devices[theTarget].Port,
+	})
+	if err != nil {
+		fmt.Println("Error connecting to device", theTarget)
+	}
+
+	messenger := &deviceMessenger{
+		device:     devices[theTarget],      // General info found during broadcast
+		connection: socket,                  // Connection to device, we die if this dies
+		endBytes:   nil,                     // The end bytes it'll respond to
+		properties: make(map[string]string), // Interface for setting/getting/caching device properties
+		killFlag:   false,                   // Flag we can trip if we need to exit
+	}
+
+	keepAliveTmp := keepAlive[theTarget]
+	keepAliveTmp.messenger = messenger
+	keepAlive[theTarget] = keepAliveTmp
+	if keepAlive[theTarget].messenger == nil {
+		fmt.Println("Nil messenger")
+	}
+	if debug {
+		fmt.Println("DEBUG: Updating device", theTarget, "messenger")
+	}
+	go messenger.mediate()
+	messenger.message("!1MVLQSTN")
 }
 
 func main() {
 	fmt.Println("Starting eISCP (ethernet Integra Serial Communication Protocol) Intermediary")
+	// Command line options
+	flag.BoolVar(&debug, "debug", false, "enable verbose debugging")
+	flag.StringVar(&defaultDevice, "device", "000000000000", "mac address of auto-connect device")
+	flag.IntVar(&devicePort, "port", 60128, "port on devices to commmunicate with")
+	// Now that we've defined our flags, parse them
+	flag.Parse()
 
-	//Start finding devices
+	if debug {
+		fmt.Println("Displaying debug output.")
+	}
+
+	fmt.Println("Searching for devices on port", devicePort)
+
+	if defaultDevice != "000000000000" {
+		fmt.Println("Searching for a device with MAC address of", defaultDevice)
+		keepAlive[defaultDevice] = &keepAliveDevice{messenger: nil, device: nil}
+	}
+
+	// Start finding devices
 	go findDevices()
 
 	r := mux.NewRouter()
@@ -230,10 +200,10 @@ func main() {
 
 func GetDevices(w http.ResponseWriter, r *http.Request) {
 	if len(devices) > 0 {
-		//Create a slice of devices to properly format our output
-		deviceSlice := make([]Device, 0)
+		// Create a slice of devices to properly format our output
+		deviceSlice := make([]deviceInfo, 0)
 		for _, device := range devices {
-			deviceSlice = append(deviceSlice, device)
+			deviceSlice = append(deviceSlice, *device)
 			fmt.Println(device)
 		}
 		resObject := GetDevicesResponse{len(devices), deviceSlice}
@@ -242,75 +212,60 @@ func GetDevices(w http.ResponseWriter, r *http.Request) {
 	} else {
 		w.WriteHeader(http.StatusNoContent)
 	}
-
 }
 
 func PutDevices(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	macAddr := vars["id"]
-	go deviceConnection(macAddr)
+	if _, present := keepAlive[macAddr]; !present {
+		keepAlive[macAddr] = &keepAliveDevice{messenger: nil, device: nil}
+		if debug {
+			fmt.Println("DEBUG: Added device with MAC addrress of", macAddr, "to the Keep-Alive list")
+		}
+	} else if debug {
+		fmt.Println("DEBUG: Device with MAC addrress of", macAddr, "already existed on the Keep-Alive list")
+	}
 	w.WriteHeader(200)
 }
 
-func deviceConnection(id string) {
-	socket, err := net.DialTCP("tcp4", nil, &net.TCPAddr{
-		IP:   devices[id].IP,
-		Port: devices[id].Port,
-	})
-	if err != nil {
-		fmt.Println("Error connecting to device")
-		devices[id].statusChan <- false
-	} else {
-		devices[id].statusChan <- true
-	}
-
-	//In parallel, read from socket
-	go func() {
-		for {
-			data := make([]byte, 1024)
-			read, err := socket.Read(data)
-			if err != nil {
-				fmt.Println("Error reading from device")
-			}
-			packet, valid := processISCP(data[:read])
-
-			if valid {
-				fmt.Println(packet)
-			}
-		}
-	}()
-
-	time.Sleep(time.Millisecond * 51)
-
-	fmt.Println()
-	count, err := socket.Write(packageISCP("!1MVLQSTN", CR_LF))
-	if err != nil {
-		fmt.Println("Write failed ", count)
-	}
-}
-
 func DeleteDevices(w http.ResponseWriter, r *http.Request) {
-	w.Write([]byte("Hello "))
+	vars := mux.Vars(r)
+	macAddr := vars["id"]
+	if _, present := keepAlive[macAddr]; present {
+		keepAlive[macAddr].messenger.kill()
+		delete(keepAlive, macAddr)
+		if debug {
+			fmt.Println("DEBUG: Remove device with MAC addrress of", macAddr, "from the Keep-Alive list")
+		}
+	} else if debug {
+		fmt.Println("DEBUG: Device with MAC addrress of", macAddr, "did not exist on the Keep-Alive list")
+	}
+	w.WriteHeader(200)
 }
 
-func HandleKill(w http.ResponseWriter, r *http.Request) { //Debug function
+func HandleKill(w http.ResponseWriter, r *http.Request) { // Debug function
 	w.Write([]byte("Goodbye"))
-	go os.Exit(1)
+	fmt.Println("REST Request Shutdown")
+	go os.Exit(0)
 }
 
-//Device type, record of facts learned through broadcast
-type Device struct {
-	Model      string
-	Port       int
-	IP         net.IP
-	Region     string
-	Macaddr    string
-	connection *net.TCPConn
-	statusChan chan bool
-	currentEnd []byte
+// Device type, record of facts learned through broadcast
+type deviceInfo struct {
+	Model   string
+	Port    int
+	IP      net.IP
+	Region  string
+	Macaddr string
 }
 
+// Used to keep track of user requested devices
+type keepAliveDevice struct {
+	messenger *deviceMessenger // Messenger, if we're alive.
+	device    *deviceInfo      //Device Info, if available
+}
+
+// Used for JSON response - probably nuke this later
 type GetDevicesResponse struct {
 	Total   int
-	Devices []Device
+	Devices []deviceInfo
 }
