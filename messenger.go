@@ -72,6 +72,29 @@ func (d *deviceMessenger) message(command string) {
 	d.sendCount++
 }
 
+func (d *deviceMessenger) getProperty(property string) string {
+	if _, present := d.properties[property]; !present {
+		timeout := time.Now().Add(time.Second)
+		d.message("!1" + property + "QSTN")
+		valid := false
+		for !valid && time.Now().Before(timeout) {
+			time.Sleep(time.Millisecond * 25)
+			_, present := d.properties[property]
+			valid = present
+		}
+		if valid {
+			return d.properties[property]
+		}
+	} else {
+		return d.properties[property]
+	}
+	return ""
+}
+
+func (d *deviceMessenger) setProperty() {
+
+}
+
 func (d *deviceMessenger) kill() {
 	d.killFlag = true
 	fmt.Println("Killing connection with", d.device.Macaddr)
